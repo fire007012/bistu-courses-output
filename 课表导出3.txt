@@ -1,0 +1,187 @@
+/**
+ * 北京信息科技大学教务系统课表导出脚本（最终版）
+ * 
+ * 使用方法:
+ * 1. 登录 https://jwxt.bistu.edu.cn/
+ * 2. 按 F12 打开开发者工具 -> 控制台 (Console)
+ * 3. 粘贴本脚本并回车
+ * 4. 输入你想导入的学期，当前学期是2025-2026-2（绝大部分情况需要把最后的-1改为-2）
+ * 5. 自动下载 CSV 文件，可直接导入 WakeUp 课程表
+ */
+(async function () {
+    console.log("开始导出课表...");
+
+    async function fetchJSON(url, options = {}) {
+        let resp = await fetch(url, options);
+        if (!resp.ok) throw new Error(`HTTP 请求失败: ${url}`);
+        return await resp.json();
+    }
+
+    try {
+        // 1. 获取当前用户信息
+        console.log("获取当前用户信息...");
+        let userUrl = "/jwapp/sys/homeapp/api/home/currentUser.do";
+        let userData = await fetchJSON(userUrl);
+        
+        let termCode = userData.datas?.welcomeInfo?.xnxqdm;
+        console.log("自动检测到的学期代码:", termCode);
+        
+        let studentId = userData.datas?.user?.xh ||   
+                        userData.datas?.user?.usrId ||
+                        userData.datas?.student?.xh ||
+                        userData.datas?.welcomeInfo?.xh ||
+                        "";
+        console.log("学号:", studentId);
+
+        if (!termCode) {
+            termCode = prompt("未能自动检测到学期代码，请输入(如 2024-2025-2):", "2024-2025-2");
+        }
+
+        let manualTerm = prompt(`当前学期代码为: ${termCode}\n如果正确请直接确定，否则输入正确的学期代码:`, termCode);
+        if (manualTerm) termCode = manualTerm;
+
+        // 2. 获取课表数据
+        console.log("正在拉取课表数据...");
+        let scheduleUrl = "/jwapp/sys/homeapp/api/home/student/getMyScheduleDetail.do";
+        let formData = new URLSearchParams();
+        formData.append('termCode', termCode);
+        if (studentId) {
+            formData.append('studentCode', studentId);
+            formData.append('xh', studentId);
+        }
+        formData.append('type', 'term');
+
+        let scheduleData = await fetchJSON(scheduleUrl, {
+            method: 'POST',
+            body: formData,
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }
+        });
+
+        console.log("课表接口返回:", scheduleData);
+
+        let arrangedList = scheduleData.datas?.arrangedList || 
+                           scheduleData.datas?.list ||
+                           scheduleData.data?.rows ||
+                           [];
+
+        if (!arrangedList.length) {
+            console.warn("未获取到课程数据，请检查学期代码和学号是否正确。");
+            alert(`未获取到课程数据。\n学期代码: ${termCode}\n学号: ${studentId || '未获取到'}\n请确认课表页面是否能正常显示。`);
+            return;
+        }
+
+        console.log(`共获取到 ${arrangedList.length} 门课程。`);
+
+        // 调试：打印第一个课程项
+        if (arrangedList.length > 0) {
+            console.log("第一个课程项的全部字段:");
+            console.log(JSON.stringify(arrangedList[0], null, 2));
+        }
+
+        // 辅助函数：从 HTML 中提取周数和地点（用于多时间段课程）
+        function parseDetail(html) {
+            let weeks = '';
+            let location = '';
+            let tempDiv = document.createElement('div');
+            tempDiv.innerHTML = html;
+            let text = tempDiv.textContent || tempDiv.innerText || '';
+            
+            // 提取开头的周数信息（数字、逗号、连接符、括号）
+            let weekMatch = text.match(/^[\d,\-—]+(?:\([单双]\))?/);
+            if (weekMatch) {
+                weeks = weekMatch[0];
+            }
+            
+            // 优先从 <a data-kblx="01"> 获取地点（教室）
+            let placeLink = tempDiv.querySelector('a[data-kblx="01"]');
+            if (placeLink) {
+                location = placeLink.textContent.trim();
+            } else {
+                // 否则取最后一个单词作为后备
+                let words = text.trim().split(/\s+/);
+                location = words.length > 1 ? words[words.length - 1] : "";
+            }
+            
+            // 格式化周数：去除方括号、括号、中文“周”，逗号转顿号
+            weeks = weeks
+                .replace(/\[.*?\]/g, '')
+                .replace(/\(单\)/g, '单')
+                .replace(/\(双\)/g, '双')
+                .replace(/周/g, '')
+                .replace(/,/g, '、')
+                .trim();
+            return { weeks, location };
+        }
+
+        // 辅助函数：从 weeksAndTeachers 提取教师（取最后一个 / 之后的部分，避免污染）
+        function extractTeacher(weeksAndTeachers) {
+            if (!weeksAndTeachers) return "";
+            let parts = weeksAndTeachers.split('/');
+            // 教师部分总是在最后一个 / 之后（可能有多个教师，用逗号分隔）
+            let teacherPart = parts[parts.length - 1];
+            // 去除 [主讲] [讲授] 等标记，并清理首尾空格
+            return teacherPart.replace(/\[.*?\]/g, '').trim();
+        }
+
+        // ========== 解析数据生成 CSV ==========
+        let csvRows = [];
+        csvRows.push(["课程名称", "星期", "开始节数", "结束节数", "老师", "地点", "周数"]);
+
+        arrangedList.forEach(item => {
+            let courseName = item.courseName || "未知课程";
+            let dayOfWeek = item.dayOfWeek || "";
+            let beginSection = item.beginSection || "";
+            let endSection = item.endSection || "";
+            
+            // 统一从 weeksAndTeachers 提取教师（所有时间段共用，多名教师逗号分隔）
+            let teacher = extractTeacher(item.weeksAndTeachers);
+
+            // 判断是否有多个详细条目（多时间段）
+            if (item.titleDetail && item.titleDetail.length > 1) {
+                // 从索引1开始遍历（索引0是课程名称摘要）
+                for (let i = 1; i < item.titleDetail.length; i++) {
+                    let detailHtml = item.titleDetail[i];
+                    let { weeks, location } = parseDetail(detailHtml);
+                    csvRows.push([courseName, dayOfWeek, beginSection, endSection, teacher, location, weeks]);
+                }
+            } else {
+                // 无详细条目，直接从 weeksAndTeachers 提取周数，地点用 placeName
+                let weeks = "";
+                if (item.weeksAndTeachers) {
+                    // 周数部分取第一个 / 之前的内容（此时不会有多余 /）
+                    let firstPart = item.weeksAndTeachers.split('/')[0];
+                    weeks = firstPart
+                        .replace(/\[.*?\]/g, '')
+                        .replace(/\(单\)/g, '单')
+                        .replace(/\(双\)/g, '双')
+                        .replace(/周/g, '')
+                        .replace(/,/g, '、')
+                        .trim();
+                }
+                let location = item.placeName || "";
+                csvRows.push([courseName, dayOfWeek, beginSection, endSection, teacher, location, weeks]);
+            }
+        });
+
+        // 3. 下载 CSV
+        let csvContent = "\uFEFF" + csvRows.map(e => e.map(f => `"${String(f).replace(/"/g, '""')}"`).join(",")).join("\n");
+
+        let blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        let link = document.createElement("a");
+        if (link.download !== undefined) {
+            let url = URL.createObjectURL(blob);
+            link.setAttribute("href", url);
+            link.setAttribute("download", `schedule_${termCode}.csv`);
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        console.log("导出完成！请检查 CSV 文件。");
+
+    } catch (err) {
+        console.error("导出失败:", err);
+        alert("导出出错，请查看控制台日志。\n" + err.message);
+    }
+})();
